@@ -22,6 +22,8 @@ class TrackStatusMessage {
 export interface SmallWebRTCTransportConstructorOptions {
   iceServers?: RTCIceServer[];
   waitForICEGathering?: boolean;
+  /** When "relay", browser uses only TURN candidates (pairs with server-side TURN in Docker/NAT setups). */
+  iceTransportPolicy?: RTCIceTransportPolicy;
 }
 
 const RENEGOTIATE_TYPE = "renegotiate";
@@ -79,6 +81,7 @@ export class SmallWebRTCTransport extends Transport {
 
   private _iceServers: RTCIceServer[] = [];
   private readonly _waitForICEGathering: boolean;
+  private readonly _iceTransportPolicy?: RTCIceTransportPolicy;
 
   private screenTrack: MediaStreamTrack | null = null;
   private _isSharingScreen: boolean = false;
@@ -86,10 +89,12 @@ export class SmallWebRTCTransport extends Transport {
   constructor({
     iceServers = [],
     waitForICEGathering = false,
+    iceTransportPolicy,
   }: SmallWebRTCTransportConstructorOptions = {}) {
     super();
     this._iceServers = iceServers;
     this._waitForICEGathering = waitForICEGathering;
+    this._iceTransportPolicy = iceTransportPolicy;
     this.mediaManager = new DailyMediaManager(
       false,
       false,
@@ -226,6 +231,9 @@ export class SmallWebRTCTransport extends Transport {
     const config: RTCConfiguration = {
       iceServers: this._iceServers,
     };
+    if (this._iceTransportPolicy) {
+      config.iceTransportPolicy = this._iceTransportPolicy;
+    }
 
     let pc = new RTCPeerConnection(config);
 
@@ -320,22 +328,25 @@ export class SmallWebRTCTransport extends Transport {
       const offer = await this.pc.createOffer();
       await this.pc.setLocalDescription(offer);
 
-      // Wait for ICE gathering to complete
+      // Wait for ICE gathering to complete (with timeout so we don't hang
+      // if TURN is unreachable or gathering stalls).
       if (this._waitForICEGathering) {
         await new Promise<void>((resolve) => {
           if (this.pc!.iceGatheringState === "complete") {
             resolve();
           } else {
+            let settled = false;
+            const done = () => {
+              if (settled) return;
+              settled = true;
+              this.pc!.removeEventListener("icegatheringstatechange", checkState);
+              resolve();
+            };
             const checkState = () => {
-              if (this.pc!.iceGatheringState === "complete") {
-                this.pc!.removeEventListener(
-                  "icegatheringstatechange",
-                  checkState,
-                );
-                resolve();
-              }
+              if (this.pc!.iceGatheringState === "complete") done();
             };
             this.pc!.addEventListener("icegatheringstatechange", checkState);
+            setTimeout(done, 10_000);
           }
         });
       }
@@ -543,17 +554,15 @@ export class SmallWebRTCTransport extends Transport {
   }
 
   private async stop(): Promise<void> {
-    if (!this.pc) {
-      logger.debug("Peer connection is already closed or null.");
-      return;
-    }
-
     if (this.dc) {
       this.dc.close();
+      this.dc = null;
     }
 
-    this.closePeerConnection(this.pc);
-    this.pc = null;
+    if (this.pc) {
+      this.closePeerConnection(this.pc);
+      this.pc = null;
+    }
 
     await this.mediaManager.disconnect();
 

@@ -20,6 +20,7 @@ export class DailyMediaManager extends MediaManager {
   private _initialized: boolean;
   private _connected: boolean;
   private _connectResolve: ((value: void | PromiseLike<void>) => void) | null;
+  private _connectReject: ((reason?: unknown) => void) | null;
 
   private _currentAudioTrack: MediaStreamTrack | null;
   private _selectedCam: MediaDeviceInfo | Record<string, never> = {};
@@ -47,6 +48,7 @@ export class DailyMediaManager extends MediaManager {
     this._connected = false;
     this._currentAudioTrack = null;
     this._connectResolve = null;
+    this._connectReject = null;
     this.onTrackStartedCallback = onTrackStartedCallback;
     this.onTrackStoppedCallback = onTrackStoppedCallback;
     this._recorderChunkSize = recorderChunkSize;
@@ -129,10 +131,21 @@ export class DailyMediaManager extends MediaManager {
     }
     this._connected = true;
     if (!this._initialized) {
-      return new Promise((resolve) => {
-        (async () => {
-          this._connectResolve = resolve;
-          await this.initialize();
+      return new Promise((resolve, reject) => {
+        this._connectResolve = () => {
+          this._connectResolve = null;
+          this._connectReject = null;
+          resolve();
+        };
+        this._connectReject = reject;
+        void (async () => {
+          try {
+            await this.initialize();
+          } catch (e) {
+            this._connectResolve = null;
+            this._connectReject = null;
+            reject(e);
+          }
         })();
       });
     }
@@ -142,11 +155,40 @@ export class DailyMediaManager extends MediaManager {
   }
 
   async disconnect(): Promise<void> {
+    if (this._connectReject) {
+      const rej = this._connectReject;
+      this._connectReject = null;
+      this._connectResolve = null;
+      rej(new Error("DailyMediaManager disconnected"));
+    }
+
     if (this._remoteAudioLevelInterval) {
       clearInterval(this._remoteAudioLevelInterval);
     }
     this._remoteAudioLevelInterval = null;
-    this._daily.leave();
+
+    try {
+      if (this._daily.isLocalAudioLevelObserverRunning()) {
+        this._daily.stopLocalAudioLevelObserver();
+      }
+    } catch {
+      // ignore
+    }
+
+    try {
+      await this._daily.leave();
+    } catch {
+      // ignore
+    }
+
+    try {
+      if (!this._daily.isDestroyed()) {
+        await this._daily.destroy();
+      }
+    } catch {
+      // ignore
+    }
+
     this._currentAudioTrack = null;
     await this._mediaStreamRecorder?.end();
     this._wavStreamPlayer?.interrupt();
@@ -287,7 +329,10 @@ export class DailyMediaManager extends MediaManager {
     if (!this._connected || !this._mediaStreamRecorder) return;
     try {
       this._mediaStreamRecorder.record((data) => {
-        this._userAudioCallback(data.mono);
+        const m = data.mono;
+        const view = new Uint8Array(m.buffer, m.byteOffset, m.byteLength);
+        const copy = new Uint8Array(view);
+        this._userAudioCallback(copy.buffer);
       }, this._recorderChunkSize);
     } catch (e) {
       const err = e as Error;
@@ -346,8 +391,10 @@ export class DailyMediaManager extends MediaManager {
             if (this._connected) {
               this._startRecording();
               if (this._connectResolve) {
-                this._connectResolve();
+                const res = this._connectResolve;
                 this._connectResolve = null;
+                this._connectReject = null;
+                res();
               }
             }
             break;

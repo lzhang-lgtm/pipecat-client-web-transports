@@ -195,7 +195,10 @@ export class WavMediaManager extends MediaManager {
 
   private async _startRecording() {
     await this._wavRecorder.record((data) => {
-      this._userAudioCallback(data.mono);
+      const m = data.mono;
+      const view = new Uint8Array(m.buffer, m.byteOffset, m.byteLength);
+      const copy = new Uint8Array(view);
+      this._userAudioCallback(copy.buffer);
     }, this._recorderChunkSize);
     const track = this._wavRecorder.stream?.getAudioTracks()[0];
     if (track) {
