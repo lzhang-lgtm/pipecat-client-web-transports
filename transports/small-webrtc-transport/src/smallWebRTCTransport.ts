@@ -598,10 +598,10 @@ export class SmallWebRTCTransport extends Transport {
   async updateMic(micId: string): Promise<void> {
     return this.mediaManager.updateMic(micId);
   }
-  updateCam(camId: string): void {
+  async updateCam(camId: string): Promise<void> {
     return this.mediaManager.updateCam(camId);
   }
-  updateSpeaker(speakerId: string): void {
+  async updateSpeaker(speakerId: string): Promise<void> {
     return this.mediaManager.updateSpeaker(speakerId);
   }
 

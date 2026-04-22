@@ -10,7 +10,35 @@ import Daily, {
   DailyParticipant,
   DailyParticipantsObject,
 } from "@daily-co/daily-js";
-import { Participant, Tracks } from "@pipecat-ai/client-js";
+import { Participant, RTVIMessage, Tracks } from "@pipecat-ai/client-js";
+
+/**
+ * Translate a raw DOMException (or anything thrown by getUserMedia /
+ * setInputDevicesAsync) into a short, user-facing message. Keeping this
+ * centralized means the UI layer never has to know browser-specific names.
+ */
+function _formatMediaError(err: unknown, kind: "mic" | "cam"): string {
+  const name = (err as { name?: string } | null)?.name ?? "";
+  const device = kind === "mic" ? "microphone" : "camera";
+  switch (name) {
+    case "NotAllowedError":
+      return `${
+        device[0].toUpperCase() + device.slice(1)
+      } permission denied. Click the lock/permissions icon in the URL bar and allow ${device} access, then try again.`;
+    case "NotFoundError":
+      return `No ${device} was found on this device.`;
+    case "NotReadableError":
+      return `The ${device} is in use by another application. Close other apps using it (Zoom, Meet, Teams, etc.) and retry.`;
+    case "OverconstrainedError":
+      return `The selected ${device} is no longer available. Pick a different one from the menu.`;
+    case "SecurityError":
+      return `Browser blocked ${device} access because the page is not served over HTTPS.`;
+    default: {
+      const msg = (err as { message?: string } | null)?.message;
+      return `Could not switch ${device}${msg ? `: ${msg}` : "."}`;
+    }
+  }
+}
 
 export class DailyMediaManager extends MediaManager {
   private _daily: DailyCall;
@@ -79,10 +107,52 @@ export class DailyMediaManager extends MediaManager {
     this._daily.on("local-audio-level", this._handleLocalAudioLevel.bind(this));
   }
 
+  /**
+   * Check the persistent browser permission for microphone before we ask
+   * Daily / getUserMedia to open a stream. Lets the UI warn users who have
+   * "Block" persisted (common in Firefox after a single refused prompt)
+   * instead of silently failing on the first setInputDevicesAsync call.
+   *
+   * Returns the permission state, or "unsupported" if the browser does not
+   * implement navigator.permissions for microphone (older Safari).
+   */
+  async queryMicPermission(): Promise<
+    PermissionState | "unsupported"
+  > {
+    try {
+      if (
+        typeof navigator === "undefined" ||
+        !navigator.permissions?.query
+      ) {
+        return "unsupported";
+      }
+      const status = await navigator.permissions.query({
+        name: "microphone" as PermissionName,
+      });
+      return status.state;
+    } catch {
+      return "unsupported";
+    }
+  }
+
   async initialize(): Promise<void> {
     if (this._initialized) {
       console.warn("DailyMediaManager already initialized");
       return;
+    }
+    if (this._micEnabled) {
+      const perm = await this.queryMicPermission();
+      if (perm === "denied") {
+        // Preflight failure — the app has a standing "Block" decision for
+        // this origin. Tell the UI immediately, but still proceed with
+        // startCamera so Daily can surface a native re-prompt if the user
+        // clears the block.
+        this._callbacks.onError?.(
+          RTVIMessage.error(
+            "Microphone access is currently blocked for this site. Click the lock/permissions icon in the URL bar, allow microphone access, and reload.",
+          ),
+        );
+      }
     }
     const infos = await this._daily.startCamera({
       startVideoOff: !this._camEnabled,
@@ -220,19 +290,48 @@ export class DailyMediaManager extends MediaManager {
     return devices.filter((device) => device.kind === "audiooutput");
   }
 
-  updateMic(micId: string) {
-    this._daily
-      .setInputDevicesAsync({ audioDeviceId: micId })
-      .then((deviceInfo) => {
-        this._selectedMic = deviceInfo.mic;
+  async updateMic(micId: string): Promise<void> {
+    // Idempotent: selecting the currently-active mic (or re-selecting the
+    // default slot when already on default) is a no-op. This matters on
+    // Firefox, where every setInputDevicesAsync triggers a fresh permission
+    // prompt for the new deviceId even when nothing changed, which is what
+    // manifested as "can't connect after I picked my microphone".
+    if (micId && this._selectedMic?.deviceId === micId) {
+      return;
+    }
+    try {
+      const deviceInfo = await this._daily.setInputDevicesAsync({
+        audioDeviceId: micId,
       });
+      this._selectedMic = deviceInfo.mic;
+      this._callbacks.onMicUpdated?.(deviceInfo.mic as MediaDeviceInfo);
+    } catch (err) {
+      // Daily keeps the previously-acquired track if setInputDevicesAsync
+      // rejects, so the user is not silently muted. Surface the failure
+      // through the RTVI error channel so the UI can react instead of
+      // silently swallowing it.
+      this._callbacks.onError?.(
+        RTVIMessage.error(_formatMediaError(err, "mic")),
+      );
+      throw err;
+    }
   }
-  updateCam(camId: string) {
-    this._daily
-      .setInputDevicesAsync({ videoDeviceId: camId })
-      .then((deviceInfo) => {
-        this._selectedCam = deviceInfo.camera;
+  async updateCam(camId: string): Promise<void> {
+    if (camId && this._selectedCam?.deviceId === camId) {
+      return;
+    }
+    try {
+      const deviceInfo = await this._daily.setInputDevicesAsync({
+        videoDeviceId: camId,
       });
+      this._selectedCam = deviceInfo.camera;
+      this._callbacks.onCamUpdated?.(deviceInfo.camera as MediaDeviceInfo);
+    } catch (err) {
+      this._callbacks.onError?.(
+        RTVIMessage.error(_formatMediaError(err, "cam")),
+      );
+      throw err;
+    }
   }
   async updateSpeaker(speakerId: string): Promise<void> {
     if (speakerId !== "default" && this._selectedSpeaker.deviceId === speakerId)

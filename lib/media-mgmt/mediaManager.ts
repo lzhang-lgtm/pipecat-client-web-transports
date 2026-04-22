@@ -3,8 +3,31 @@ import { WavRecorder, WavStreamPlayer } from "../wavtools";
 import {
   RTVIClientOptions,
   RTVIEventCallbacks,
+  RTVIMessage,
   Tracks,
 } from "@pipecat-ai/client-js";
+
+/** Translate a DOMException-like mic/cam error into a user-facing string. */
+function _formatMediaError(err: unknown, kind: "mic" | "cam"): string {
+  const name = (err as { name?: string } | null)?.name ?? "";
+  const device = kind === "mic" ? "microphone" : "camera";
+  switch (name) {
+    case "NotAllowedError":
+      return `${device[0].toUpperCase() + device.slice(1)} permission denied. Click the lock/permissions icon in the URL bar and allow ${device} access, then try again.`;
+    case "NotFoundError":
+      return `No ${device} was found on this device.`;
+    case "NotReadableError":
+      return `The ${device} is in use by another application. Close other apps using it and retry.`;
+    case "OverconstrainedError":
+      return `The selected ${device} is no longer available. Pick a different one from the menu.`;
+    case "SecurityError":
+      return `Browser blocked ${device} access because the page is not served over HTTPS.`;
+    default: {
+      const msg = (err as { message?: string } | null)?.message;
+      return `Could not switch ${device}${msg ? `: ${msg}` : "."}`;
+    }
+  }
+}
 
 export abstract class MediaManager {
   declare protected _userAudioCallback: (data: ArrayBuffer) => void;
@@ -44,9 +67,9 @@ export abstract class MediaManager {
   abstract getAllCams(): Promise<MediaDeviceInfo[]>;
   abstract getAllSpeakers(): Promise<MediaDeviceInfo[]>;
 
-  abstract updateMic(micId: string): void;
-  abstract updateCam(camId: string): void;
-  abstract updateSpeaker(speakerId: string): void;
+  abstract updateMic(micId: string): Promise<void>;
+  abstract updateCam(camId: string): Promise<void>;
+  abstract updateSpeaker(speakerId: string): Promise<void>;
 
   abstract get selectedMic(): MediaDeviceInfo | Record<string, never>;
   abstract get selectedCam(): MediaDeviceInfo | Record<string, never>;
@@ -129,21 +152,49 @@ export class WavMediaManager extends MediaManager {
 
   async updateMic(micId: string): Promise<void> {
     const prevMic = this._wavRecorder.deviceSelection;
+    const prevMicId = prevMic?.deviceId;
+
+    // Idempotent short-circuit — Firefox re-prompts for every deviceId change,
+    // so avoid gratuitous churn when the user re-selects the current device.
+    if (micId && prevMicId && micId === prevMicId) return;
+
+    // WavRecorder holds at most one MediaStream, so we must end() before
+    // begin(). That means a failure of begin() leaves the user silent. If the
+    // new device fails, roll back to the previous one rather than leaving the
+    // app muted, and surface the original error through the RTVI error channel.
     await this._wavRecorder.end();
-    await this._wavRecorder.begin(micId);
-    if (this._micEnabled) {
-      await this._startRecording();
-    }
-    const curMic = this._wavRecorder.deviceSelection;
-    if (curMic && prevMic && prevMic.label !== curMic.label) {
-      this._callbacks.onMicUpdated?.(curMic);
+    try {
+      await this._wavRecorder.begin(micId);
+      if (this._micEnabled) {
+        await this._startRecording();
+      }
+      const curMic = this._wavRecorder.deviceSelection;
+      if (curMic && prevMic && prevMic.label !== curMic.label) {
+        this._callbacks.onMicUpdated?.(curMic);
+      }
+    } catch (err) {
+      this._callbacks.onError?.(
+        RTVIMessage.error(_formatMediaError(err, "mic")),
+      );
+      // Best-effort rollback: re-open the previous device so the user is not
+      // left without audio. If the rollback itself fails (e.g. the previous
+      // device was unplugged too), we just stay ended and let the UI re-prompt.
+      if (prevMicId) {
+        try {
+          await this._wavRecorder.begin(prevMicId);
+          if (this._micEnabled) await this._startRecording();
+        } catch {
+          // swallow: original error already surfaced above
+        }
+      }
+      throw err;
     }
   }
 
-  updateCam(camId: string): void {
+  async updateCam(camId: string): Promise<void> {
     // TODO: Video not supported yet
   }
-  updateSpeaker(speakerId: string): void {
+  async updateSpeaker(speakerId: string): Promise<void> {
     // TODO: Implement speaker support
   }
 
@@ -223,7 +274,11 @@ export class WavMediaManager extends MediaManager {
         (currentDevice.deviceId === "default" &&
           currentDevice.label !== defaultDevice?.label))
     ) {
-      this.updateMic("");
+      // Fire-and-forget: we're inside a devicechange event handler with no
+      // place to await. updateMic already surfaces failures via onError.
+      void this.updateMic("").catch(() => {
+        /* already reported via onError */
+      });
     }
   }
 }
